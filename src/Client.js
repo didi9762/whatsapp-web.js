@@ -1138,6 +1138,7 @@ class Client extends EventEmitter {
             sendMediaAsDocument: options.sendMediaAsDocument,
             sendMediaAsHd: options.sendMediaAsHd,
             caption: options.caption,
+            isCaptionByUser: options.caption ? true : false,
             quotedMessageId: options.quotedMessageId,
             parseVCards: options.parseVCards !== false,
             mentionedJidList: options.mentions || [],
@@ -2112,7 +2113,7 @@ class Client extends EventEmitter {
      * @returns {Promise<boolean>} Returns true if the operation completed successfully, false otherwise
      */
     async deleteChannel(channelId) {
-        return await this.client.pupPage.evaluate(async (channelId) => {
+        return await this.pupPage.evaluate(async (channelId) => {
             const channel = await window.WWebJS.getChat(channelId, { getAsModel: false });
             if (!channel) return false;
             try {
