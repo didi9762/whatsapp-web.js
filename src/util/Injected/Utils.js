@@ -13,10 +13,13 @@ exports.LoadUtils = () => {
         const chat = await window.WWebJS.getChat(chatId, { getAsModel: false });
         if (chat) {
             window.Store.WAWebStreamModel.Stream.markAvailable();
-            await window.Store.SendSeen.sendSeen({
-                chat: chat,
-                threadId: undefined
-            });         
+            try {
+                // New signature for WWeb 2.3000+ (PR #5729)
+                await window.Store.SendSeen.sendSeen({ chat: chat, threadId: undefined });
+            } catch {
+                // Fallback to old signature for older versions
+                await window.Store.SendSeen.sendSeen(chat);
+            }
             window.Store.WAWebStreamModel.Stream.markUnavailable();
             return true;
         }
@@ -146,6 +149,7 @@ exports.LoadUtils = () => {
         let vcardOptions = {};
         if (options.contactCard) {
             let contact = window.Store.Contact.get(options.contactCard);
+            if (!contact) throw new Error('Contact not found for contactCard: ' + options.contactCard);
             vcardOptions = {
                 body: window.Store.VCard.vcardFromContactModel(contact).vcard,
                 type: 'vcard',
@@ -153,7 +157,8 @@ exports.LoadUtils = () => {
             };
             delete options.contactCard;
         } else if (options.contactCardList) {
-            let contacts = options.contactCardList.map(c => window.Store.Contact.get(c));
+            let contacts = options.contactCardList.map(c => window.Store.Contact.get(c)).filter(Boolean);
+            if (contacts.length === 0) throw new Error('No valid contacts found in contactCardList');
             let vcards = contacts.map(c => window.Store.VCard.vcardFromContactModel(c));
             vcardOptions = {
                 type: 'multi_vcard',
@@ -215,7 +220,7 @@ exports.LoadUtils = () => {
 
         let listOptions = {};
         if (options.list) {
-            if (window.Store.Conn.platform === 'smba' || window.Store.Conn.platform === 'smbi') {
+            if (window.Store.Conn?.platform === 'smba' || window.Store.Conn?.platform === 'smbi') {
                 throw '[LT01] Whatsapp business can\'t send this yet';
             }
             listOptions = {
@@ -506,6 +511,7 @@ exports.LoadUtils = () => {
             mimetype: mediaData.mimetype,
             mediaObject,
             mediaType,
+            uploadQpl: window.Store.MediaUpload.startMediaUploadQpl({ entryPoint: 'MediaUpload' }),
             ...(sendToChannel ? { calculateToken: window.Store.SendChannelMessage.getRandomFilehash } : {})
         };
 
@@ -572,16 +578,35 @@ exports.LoadUtils = () => {
 
         if (isChannel) {
             try {
-                chat = window.Store.WAWebNewsletterCollection.get(chatId);
+                const newsletterCollection = window.Store.NewsletterCollection || window.Store.WAWebNewsletterMetadataCollection;
+                chat = newsletterCollection?.get(chatId);
                 if (!chat) {
                     await window.Store.ChannelUtils.loadNewsletterPreviewChat(chatId);
-                    chat = await window.Store.WAWebNewsletterCollection.find(chatWid);
+                    chat = await newsletterCollection?.find(chatWid);
                 }
             } catch (err) {
                 chat = null;
             }
         } else {
-            chat = window.Store.Chat.get(chatWid) || (await window.Store.FindOrCreateChat.findOrCreateLatestChat(chatWid))?.chat;
+            chat = window.Store.Chat.get(chatWid);
+            if (!chat) {
+                chat = (await window.Store.FindOrCreateChat.findOrCreateLatestChat(chatWid).catch(() => null))?.chat;
+            }
+            if (!chat) {
+                try {
+                    const query = window.require('WAWebContactSyncUtils').constructUsyncDeltaQuery([{
+                        type: 'add',
+                        phoneNumber: chatWid.user
+                    }]);
+                    const result = await query.execute();
+                    if (result?.list?.[0]?.lid) {
+                        const chatLid = window.Store.WidFactory.createWid(result.list[0].lid);
+                        chat = (await window.Store.FindOrCreateChat.findOrCreateLatestChat(chatLid).catch(() => null))?.chat;
+                    }
+                } catch (e) {
+                    // LID resolution failed, chat remains undefined
+                }
+            }
         }
 
         return getAsModel && chat
@@ -625,9 +650,10 @@ exports.LoadUtils = () => {
     };
 
     window.WWebJS.getChannels = async () => {
-        const channels = window.Store.WAWebNewsletterCollection.getModelsArray();
+        const newsletterCollection = window.Store.NewsletterCollection || window.Store.WAWebNewsletterMetadataCollection;
+        const channels = newsletterCollection?.getModelsArray();
         const channelPromises = channels?.map((channel) => window.WWebJS.getChatModel(channel, { isChannel: true }));
-        return await Promise.all(channelPromises);
+        return await Promise.all(channelPromises ?? []);
     };
 
     window.WWebJS.getChatModel = async (chat, { isChannel = false } = {}) => {
@@ -645,8 +671,8 @@ exports.LoadUtils = () => {
         if (chat.groupMetadata) {
             model.isGroup = true;
             const chatWid = window.Store.WidFactory.createWid(chat.id._serialized);
-            const groupMetadata = window.Store.GroupMetadata || window.Store.WAWebGroupMetadataCollection;
-            await groupMetadata.update(chatWid);
+            const groupMetadataStore = window.Store.GroupMetadata || window.Store.WAWebGroupMetadataCollection;
+            await groupMetadataStore?.update(chatWid);
             chat.groupMetadata.participants._models
                 .filter(x => x.id?._serialized?.endsWith('@lid'))
                 .forEach(x => x.contact?.phoneNumber && (x.id = x.contact.phoneNumber));
@@ -655,8 +681,8 @@ exports.LoadUtils = () => {
         }
 
         if (chat.newsletterMetadata) {
-            const newsletterMetadata = window.Store.NewsletterMetadataCollection || window.Store.WAWebNewsletterMetadataCollection;
-            await newsletterMetadata.update(chat.id);
+            const newsletterStore = window.Store.NewsletterMetadataCollection || window.Store.WAWebNewsletterMetadataCollection;
+            await newsletterStore?.update(chat.id);
             model.channelMetadata = chat.newsletterMetadata.serialize();
             model.channelMetadata.createdAtTs = chat.newsletterMetadata.creationTime;
         }
@@ -704,12 +730,54 @@ exports.LoadUtils = () => {
 
     window.WWebJS.getContact = async contactId => {
         const wid = window.Store.WidFactory.createWid(contactId);
-        let contact = await window.Store.Contact.find(wid);
-        if (contact.id._serialized.endsWith('@lid')) {
+
+        // Tier 1: Sync cache lookup (fast path)
+        let contact = window.Store.Contact.get(wid);
+
+        // Tier 2: Async server fetch with error handling
+        if (!contact) {
+            try {
+                contact = await window.Store.Contact.find(wid);
+            } catch (_) {
+                // find() can throw on server errors (e.g., HTTP 400) — continue with null
+            }
+        }
+
+        // Tier 3: LID resolution for unsynced contacts (same pattern as getChat)
+        if (!contact) {
+            try {
+                const query = window.require('WAWebContactSyncUtils').constructUsyncDeltaQuery([{
+                    type: 'add',
+                    phoneNumber: wid.user
+                }]);
+                const result = await query.execute();
+                if (result?.list?.[0]?.lid) {
+                    const contactLid = window.Store.WidFactory.createWid(result.list[0].lid);
+                    contact = window.Store.Contact.get(contactLid)
+                        || await window.Store.Contact.find(contactLid).catch(() => null);
+                }
+            } catch (_) {
+                // LID resolution failed — contact remains null
+            }
+        }
+
+        if (!contact) return null;
+
+        // Safe LID-to-phone resolution (guard against undefined phoneNumber per PR #5663)
+        if (contact.id?._serialized?.endsWith('@lid') && contact.phoneNumber) {
             contact.id = contact.phoneNumber;
         }
-        const bizProfile = await window.Store.BusinessProfile.fetchBizProfile(wid);
-        bizProfile.profileOptions && (contact.businessProfile = bizProfile);
+
+        // Business profile is non-essential metadata
+        try {
+            const bizProfile = await window.Store.BusinessProfile.fetchBizProfile(wid);
+            if (bizProfile?.profileOptions) {
+                contact.businessProfile = bizProfile;
+            }
+        } catch (_) {
+            // fetchBizProfile failed — proceed without it
+        }
+
         return window.WWebJS.getContactModel(contact);
     };
 
@@ -1023,8 +1091,32 @@ exports.LoadUtils = () => {
                 .value
                 .addParticipantsParticipantMixins;
         } catch (err) {
-            data.code = 400;
-            return data;
+            if (String(err?.message || err).toLowerCase().includes('lid')) {
+                try {
+                    const query = window.require('WAWebContactSyncUtils').constructUsyncDeltaQuery([{
+                        type: 'add',
+                        phoneNumber: participantWid.user
+                    }]);
+                    const result = await query.execute();
+                    if (result?.list?.[0]?.lid) {
+                        const resolvedLid = window.Store.WidFactory.createWid(result.list[0].lid);
+                        const resolvedArgs = [{
+                            participantJid: window.Store.WidToJid.widToUserJid(resolvedLid)
+                        }];
+                        rpcResult = await window.Store.GroupParticipants.sendAddParticipantsRPC({ participantArgs: resolvedArgs, iqTo });
+                        resultArgs = rpcResult.value.addParticipant[0]
+                            .addParticipantsParticipantAddedOrNonRegisteredWaUserParticipantErrorLidResponseMixinGroup
+                            .value
+                            .addParticipantsParticipantMixins;
+                    }
+                } catch {
+                    // LID resolution or retry failed
+                }
+            }
+            if (!rpcResult) {
+                data.code = 400;
+                return data;
+            }
         }
 
         if (rpcResult.name === 'AddParticipantsResponseSuccess') {
